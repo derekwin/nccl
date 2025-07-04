@@ -2,6 +2,8 @@
 #define NCCL_DEVICE_SYMMETRIC_H_
 
 #include "nccl.h"
+#define ncclFloat8e4m3 10
+#define ncclFloat8e5m2 11
 #include "nccl_common.h"
 #include "bitops.h"
 
