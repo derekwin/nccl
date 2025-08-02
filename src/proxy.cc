@@ -20,7 +20,11 @@
 #include <sys/time.h>
 #include <sched.h>
 
-#define NCCL_MAX_PROXY_CONNECTIONS (NCCL_MAX_LOCAL_RANKS+1)
+#include "jring.h"
+
+static size_t align_up(size_t size, size_t align) {
+    return (size + align - 1) & ~(align - 1);
+}
 
 enum { proxyRecv=0, proxySend=1 };
 void* ncclProxyServiceUDS(void* _args);
@@ -420,115 +424,113 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   return ncclSuccess;
 }
 
-static ncclResult_t ProxyAppend(struct ncclProxyProgressState* state, struct ncclProxyOp* op) {
-  struct ncclProxyConnection* connection = op->connection;
-  int shared = connection->shared;
-  struct ncclProxyArgs* args = *connection->proxyAppendPtr;
-
-  if (args) {
-    if (shared && args->opCount == op->opCount) {
-      NCCLCHECK(ncclProxyOpToArgs(op, args, args->nsubs));
-      DEBUG_PROXY_PRINT("Insert (%d/%5ld/%5ld) as group with %5ld\n", shared, args->opCount, op->opCount, OP_INDEX(args));
-    } else {
-      struct ncclProxyArgs* prevArgs = args;
-      NCCLCHECK(allocateArgs(state, &args));
-      NCCLCHECK(ncclProxyOpToArgs(op, args, 0));
-      prevArgs->nextPeer = args;
-      DEBUG_PROXY_PRINT("Insert  %5ld (%d/%5ld/%5ld) as nextPeer of %5ld\n", OP_INDEX(args), shared, prevArgs->opCount, args->opCount, OP_INDEX(prevArgs));
-      *(args->proxyAppendPtr) = args;
-    }
-  } else {
-    // Nothing running for that peer. Add to the list
-    NCCLCHECK(allocateArgs(state, &args));
-    NCCLCHECK(ncclProxyOpToArgs(op, args, 0));
-    if (state->active == NULL) {
-      // Create the list
-      DEBUG_PROXY_PRINT("Insert  %5ld (%d/%5ld) as first element\n", OP_INDEX(args), shared, args->opCount);
-      state->active = args;
-    } else {
-      // Append element at the end of the list
-      struct ncclProxyArgs* last = state->active;
-      while (last->next) last = last->next;
-      last->next = args;
-      DEBUG_PROXY_PRINT("Insert  %5ld (%d/%5ld) as last element\n", OP_INDEX(args), shared, args->opCount);
-    }
-    *(args->proxyAppendPtr) = args;
-  }
-  return ncclSuccess;
-}
-
-ncclResult_t ncclProxyPost(struct ncclProxyOpsPool* pool, int nextOps, int nextOpsEnd) {
-  pthread_mutex_lock(&pool->mutex);
-  if (pool->nextOps == -1) {
-    pool->nextOps = nextOps;
-    pthread_cond_signal(&pool->cond);
-  } else {
-    pool->ops[pool->nextOpsEnd].next = nextOps;
-  }
-  pool->nextOpsEnd = nextOpsEnd;
-  pthread_mutex_unlock(&pool->mutex);
-  return ncclSuccess;
-}
-
 static ncclResult_t ncclLocalOpAppend(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, struct ncclProxyOp* proxyOp) {
-  int tpLocalRank = comm->topParentLocalRanks[comm->localRank];
   struct ncclProxyOps* proxyOps = comm->proxyState->proxyOps;
   if (proxyOps == NULL) return ncclInternalError;
   proxyOps += proxyConn->tpLocalRank;
-  struct ncclProxyOpsPool* pool = proxyOps->pool;
+  struct ncclProxyOpsPool* pool = proxyOps->pool; // main thread's pool
 
   TIME_START(0);
-  int opIndex = proxyOps->freeOp;
-  struct ncclProxyOp* op;
-  if (opIndex != -1) {
-    op = pool->ops+opIndex;
-    proxyOps->freeOp = op->next;
-  } else {
-    int freeOp;
-    while ((freeOp = pool->freeOps[tpLocalRank]) == -1) sched_yield();
-    int freeOpNew;
-    while ((freeOpNew = __sync_val_compare_and_swap(pool->freeOps+tpLocalRank, freeOp, -1)) != freeOp) freeOp = freeOpNew;
-    opIndex = freeOp;
-    op = pool->ops+opIndex;
-    proxyOps->freeOp = op->next;
+  bool should_flush = false;
+  if (proxyOps->count > 0) {
+      if (proxyOps->tmpOp[proxyOps->count - 1].opCount != proxyOp->opCount) {
+          should_flush = true;
+      }
   }
-  if (op->next != -1) __builtin_prefetch(pool->ops+op->next); // Prefetch next free op
-  memcpy(op, proxyOp, sizeof(struct ncclProxyOp));
-  if (proxyOp->ringAlgo) proxyOp->ringAlgo->incRefCount();
-  op->next = -1;
-  op->connection = proxyConn->connection;
-  if (proxyOps->nextOps == -1) {
-    proxyOps->nextOps = proxyOps->nextOpsEnd = opIndex;
-  } else {
-    pool->ops[proxyOps->nextOpsEnd].next = opIndex;
-    proxyOps->nextOpsEnd = opIndex;
+  if (proxyOps->count >= MAX_OPS_PER_PEER) {
+      should_flush = true;  // batch is full
   }
-  if (++proxyOps->count == MAX_OPS_PER_PEER) {
-    // Post what we have so far to free some ops in the pool
-    // Do not post last operations as we could have more coming with the same opCount, and posting
-    // them in different batches would break proxyArgs aggregation with subs.
-    uint64_t lastOpCount = pool->ops[proxyOps->nextOpsEnd].opCount;
-    int lastOp = -1;
-    int toSend = 0;
-    int ops = 0;
-    for (int op= proxyOps->nextOps; op != proxyOps->nextOpsEnd; op=pool->ops[op].next) {
-      ops++;
-      if (pool->ops[op].opCount != lastOpCount) {
-        lastOp = op;
-        toSend = ops;
+
+  if (should_flush) {
+    // Step 1: merge Ops with same opCount from tmpOp to tmpArgsPerConn
+    for (int i = 0; i < proxyOps->count; i++) {
+      struct ncclProxyOp* op = &proxyOps->tmpOp[i];
+      struct ncclProxyConnection* conn = op->connection;
+      int connId = conn->id;
+      int shared = conn->shared;
+      struct ncclProxyArgs** pArgs = &proxyOps->tmpArgsPerConn[connId].args;
+      struct ncclProxyArgs** pLast = &proxyOps->tmpArgsPerConn[connId].lastArgs;
+
+      if (!proxyOps->tmpArgsPerConn[connId].args) {
+        int progressId = connId % N_PROXY_PROGRESS;
+        struct ncclProxyProgressState* state = &comm->proxyState->progressState[progressId];
+        NCCLCHECK(allocateArgs(state, &proxyOps->tmpArgsPerConn[connId].args));
+      }
+
+      if (!TEST_BIT(proxyOps->usedMap, connId)) {
+        // first time
+        SET_BIT(proxyOps->usedMap, connId);
+        proxyOps->connIdList[proxyOps->connUsedCount++] = connId;
+        NCCLCHECK(ncclProxyOpToArgs(op, proxyOps->tmpArgsPerConn[connId].args, 0));
+        *pLast = *pArgs;
+      } else {
+        // PXN, refer from ProxyAppend()
+        struct ncclProxyArgs* last = *pLast;
+        if (shared && last->opCount == op->opCount) {
+          // can be merged
+          NCCLCHECK(ncclProxyOpToArgs(op, last, last->nsubs));
+        } else {
+          // cannot be merged, create a new args，link it to last->nextPeer
+          struct ncclProxyArgs* newArgs = NULL;
+          int progressId = conn->id % N_PROXY_PROGRESS;
+          struct ncclProxyProgressState* state = &comm->proxyState->progressState[progressId];
+          NCCLCHECK(allocateArgs(state, &newArgs));
+          NCCLCHECK(ncclProxyOpToArgs(op, newArgs, 0));
+          last->nextPeer = newArgs;
+          *pLast = newArgs;
+        }
       }
     }
-    if (lastOp == -1) {
-      WARN("Unable to post incomplete proxy op chain %d..%d (opCount %ld)", proxyOps->nextOps, proxyOps->nextOpsEnd, lastOpCount);
-      return ncclInternalError;
+
+    struct ncclProxyArgs* batch[N_PROXY_PROGRESS][NCCL_MAX_LOCAL_RANKS + 1];
+    uint batch_count[N_PROXY_PROGRESS] = {0};
+
+    // Step 2: distribute to different batch via tplocalRank
+    for (int i = 0; i < proxyOps->connUsedCount; i++) {
+        int connId = proxyOps->connIdList[i];
+        struct ncclProxyArgs* args = proxyOps->tmpArgsPerConn[connId].args;
+        if (!args) continue;
+
+        int ringId = connId % N_PROXY_PROGRESS;
+        batch[ringId][batch_count[ringId]++] = args;
+
+        proxyOps->tmpArgsPerConn[connId].args = NULL;
+        proxyOps->tmpArgsPerConn[connId].lastArgs = NULL;
     }
-    // Cut chain at lastOp
-    int nextOps = proxyOps->nextOps;
-    proxyOps->nextOps = pool->ops[lastOp].next;
-    pool->ops[lastOp].next = -1;
-    NCCLCHECK(ncclProxyPost(proxyOps->pool, nextOps, lastOp));
-    proxyOps->count -= toSend;
+
+    // Step 3: send to jring buffer
+    for (int r = 0; r < N_PROXY_PROGRESS; r++) {
+        uint remaining = batch_count[r];
+        int offset = 0;
+
+        while (remaining > 0) {
+            unsigned int enq = jring_enqueue_burst(pool->ringBufs[r], (void**)&batch[r][offset], remaining, &remaining);
+            if (enq > 0) {
+                offset += enq;
+            } else {
+                sched_yield();
+            }
+        }
+    }
+
+    // Step 4: reset pool
+    for (int i = 0; i < proxyOps->connUsedCount; i++) {
+        int connId = proxyOps->connIdList[i];
+        proxyOps->tmpArgsPerConn[connId].args = NULL;
+        proxyOps->tmpArgsPerConn[connId].lastArgs = NULL;
+    }
+    CLEAR_ALL_BITS(proxyOps->usedMap);
+    proxyOps->connUsedCount = 0;
+    proxyOps->count = 0;
   }
+
+  // Step 5: add cur op to tmpOp
+  memcpy(&proxyOps->tmpOp[proxyOps->count], proxyOp, sizeof(struct ncclProxyOp));
+  if (proxyOp->ringAlgo) proxyOp->ringAlgo->incRefCount();
+  proxyOps->tmpOp[proxyOps->count].next = -1;
+  proxyOps->tmpOp[proxyOps->count].connection = proxyConn->connection;
+  proxyOps->count++;
+
   TIME_STOP(0);
   return ncclSuccess;
 }
@@ -764,93 +766,23 @@ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclPr
 
 NCCL_PARAM(ProxyAppendBatchSize, "PROXY_APPEND_BATCH_SIZE", 16);
 
-static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, int* added) {
-  struct ncclProxyProgressState* state = &proxyState->progressState;
-  if (state->opsPool == NULL) return ncclInternalError;
-  struct ncclProxyOpsPool* pool = state->opsPool;
+#define NCCL_JRING_PROXY_BURST_SIZE 16
+static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, 
+                                          struct ncclProxyArgs* batch,    // output：head pointer of the list of args we got
+                                          int* added,                     // output：the num of args we got
+                                          int threadId) {
+    struct ncclProxyOpsPool* pool = proxyState->progressState[threadId].opsPool;
+    if (pool->ringBufs[threadId] == NULL) return ncclInternalError;
+    void* eHandle;
 
-  if (state->nextOps != -1) goto process_nextops;
-
-  void* eHandle;
-  // If we have ops to progress, no need to block waiting for something to arrive or even wait for the lock
-  // to be available. Exit, continue progress, and come back later.
-  if (state->active != NULL && (pool->nextOps == -1 || pthread_mutex_trylock(&pool->mutex) != 0)) return ncclSuccess;
-
-  if (state->active == NULL) {
-    pthread_mutex_lock(&pool->mutex);
-    if (pool->nextOps == -1 && !state->stop) {
-      ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
-      ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlSleep);
-      pthread_cond_wait(&pool->cond, &pool->mutex);
-      ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlWakeup);
-      ncclProfilerStopProxyCtrlEvent(eHandle);
-    }
-  }
-  state->nextOps = pool->nextOps;
-  pool->nextOps = pool->nextOpsEnd = -1;
-  pthread_mutex_unlock(&pool->mutex);
-
-process_nextops:
-  ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
-  ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlAppend);
-  TIME_START(2);
-  int freeOp[NCCL_MAX_PROXY_CONNECTIONS];
-  int freeOpEnd[NCCL_MAX_PROXY_CONNECTIONS];
-  for (int i = 0; i < proxyState->tpLocalnRanks; i++) freeOp[i] = -1;
-
-  uint64_t lastOpCount = 0;
-  int lastPeer = -1;
-  int count = 0;
-  for (int opIndex = state->nextOps; opIndex != -1;) {
-    struct ncclProxyOp* peerOp = pool->ops+opIndex;
-    int peer = opIndex / MAX_OPS_PER_PEER;
-    if ((lastOpCount && peerOp->opCount != lastOpCount) || ((lastPeer != -1) && peer != lastPeer)) count++;
-    if (count == ncclParamProxyAppendBatchSize()+1) break;
-    lastOpCount = peerOp->opCount;
-    lastPeer = peer;
-    if (peerOp->connection == NULL) return ncclInternalError;
-    if (peerOp->next != -1) __builtin_prefetch(pool->ops+peerOp->next);
-    NCCLCHECK(ProxyAppend(state, peerOp));
-    (*added)++;
-    int lastOpIndex = opIndex;
-    opIndex = peerOp->next;
-    // Return op to peer pool
-    if (freeOp[peer] == -1) {
-      freeOpEnd[peer] = lastOpIndex;
-    } else {
-      peerOp->next = freeOp[peer];
-    }
-    freeOp[peer] = lastOpIndex;
-    state->nextOps = opIndex;
-  }
-
-  for (int i = 0; i < proxyState->tpLocalnRanks; i++) {
-    if (freeOp[i] == -1) continue;
-    int newFree = freeOp[i];
-    int oldFree = pool->freeOps[i];
-    // Coverity gets confused by the complex code structure here.  The previous "for" loop ensures that freeOpEnd[i]
-    // is initialized so long as freeOp[i] is initialized (is not -1).  In the current loop we filter out uninitialized
-    // freeOp[i], hence ensuring that freeOpEnd[i] is also initialized.
-    // coverity[uninit_use:FALSE]
-    pool->ops[freeOpEnd[i]].next = oldFree;
-    if (oldFree == -1) {
-      // Nothing for the main thread to consume, we can set it.
-      pool->freeOps[i] = newFree;
-    } else {
-      // The main thread may recycle free ops at any time, replace the freeOps value atomically and check it worked.
-      int swap = __sync_val_compare_and_swap(pool->freeOps+i, oldFree, newFree);
-      if (swap != oldFree) {
-        if (swap != -1) return ncclInternalError;
-        // Ops were recycled while we were trying to swap, just set the value directly now.
-        pool->ops[freeOpEnd[i]].next = -1;
-        pool->freeOps[i] = newFree;
-      }
-    }
-  }
-  ncclProfilerRecordProxyCtrlEventState(eHandle, *added, ncclProfilerProxyCtrlAppendEnd);
-  ncclProfilerStopProxyCtrlEvent(eHandle);
-  TIME_STOP(2);
-  return ncclSuccess;
+    ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
+    ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlAppend);
+    TIME_START(2);
+    *added = jring_dequeue_burst(pool->ringBufs[threadId], batch, NCCL_JRING_PROXY_BURST_SIZE, nullptr);
+    ncclProfilerRecordProxyCtrlEventState(eHandle, *added, ncclProfilerProxyCtrlAppendEnd);
+    ncclProfilerStopProxyCtrlEvent(eHandle);
+    TIME_STOP(2);
+    return ncclSuccess;
 }
 
 #include <signal.h>
@@ -899,64 +831,77 @@ exit:
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
 
-void* ncclProxyProgress(void *proxyState_) {
-  struct ncclProxyState* proxyState = (struct ncclProxyState*)proxyState_;
+struct ncclProxyProgressArgs {
+  struct ncclProxyState* proxyState;
+  int threadId;
+};
+
+void* ncclProxyProgress(void* args_) {
+  struct ncclProxyProgressArgs* args = (struct ncclProxyProgressArgs*)args_;
+  struct ncclProxyState* proxyState = args->proxyState;
+  int threadId = args->threadId;
+
+  if(threadId > N_PROXY_PROGRESS) {
+    WARN("[Proxy Progress] Invalid threadId %d", threadId);
+    return NULL;
+  }
   if (setProxyThreadContext(proxyState)) {
     INFO(NCCL_INIT, "[Proxy Progress] Set CUDA context on device %d", proxyState->cudaDev);
   } else if (cudaSetDevice(proxyState->cudaDev) != cudaSuccess) {
     WARN("[Proxy Progress] Failed to set CUDA device %d", proxyState->cudaDev);
   }
-  // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
-
   INFO(NCCL_INIT, "[Proxy Progress] Device %d CPU core %d", proxyState->cudaDev, sched_getcpu());
 
-  struct ncclProxyProgressState* state = &proxyState->progressState;
-  state->nextOps = -1;
+  struct ncclProxyProgressState* state = &proxyState->progressState[threadId];
   const int sig = ncclParamProxyDumpSignal();
   if (sig != -1) signal(sig, ncclDumpProxyState);
-  ncclLastProxyState = state;
   char threadName[NCCL_THREAD_NAMELEN];
   snprintf(threadName, NCCL_THREAD_NAMELEN, "NCCL Progress%2d", proxyState->cudaDev);
   nvtxNameOsThreadA(syscall(SYS_gettid), threadName);
 
-  int lastIdle = 0;
-  /* Too frequent call of ncclProxyGetPostedOps() will result in perf regression for small message
-   * communication. proxyOpAppendCounter is a counter that helps us decide if we need to append proxy ops.
-   * After each progress, proxyOpAppendCounter will increase by 1 and compare with environment variable
-   * ncclParamProgressAppendOpFreq(). If they are equal, we will append proxy ops. This will decrease the
-   * frequency of calling ncclProxyGetPostedOps() and reduce the perf impact. */
-  int proxyOpAppendCounter = 0;
+  struct ncclProxyArgs* pending[NCCL_JRING_PROXY_BURST_SIZE];
+  int pendCnt = 0, pendNext;
+
+  struct ncclProxyArgs batch[NCCL_JRING_PROXY_BURST_SIZE];
+  int added = 0;
+
   do {
-    int idle = 1;
-    ncclResult_t ret = progressOps(proxyState, state, state->active, &idle);
-    if (ret != ncclSuccess) {
-      __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
-      INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
-      break;
-    }
-    if ((lastIdle == 0 && idle == 1) || (lastIdle == 1 && idle == 0)) {
-      void* eHandle;
-      ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
-      if (lastIdle == 0 && idle == 1) ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlIdle);
-      if (lastIdle == 1 && idle == 0) ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlActive);
-      ncclProfilerStopProxyCtrlEvent(eHandle);
-    }
-    if (idle || !state->active || (++proxyOpAppendCounter == ncclParamProgressAppendOpFreq())) {
-      int added = 0;
-      proxyOpAppendCounter = 0;
-      TIME_START(3);
-      ret = ncclProxyGetPostedOps(proxyState, &added);
-      if (added) { TIME_STOP(3); } else { TIME_CANCEL(3); }
-      if (ret != ncclSuccess) {
-        __atomic_store_n(&proxyState->asyncResult, ret, __ATOMIC_RELEASE);
-        INFO(NCCL_ALL,"%s:%d -> %d [Progress Thread]", __FILE__, __LINE__, ret);
-      }
-      if (added == 0) {
-        sched_yield(); // No request progressed. Let others run.
+    // 1 run pending args first
+    pendNext = 0;
+    for (int i = 0; i < pendCnt; i++) {
+      struct ncclProxyArgs* op = pending[i];
+      ncclResult_t ret = op->progress(proxyState, op);
+      if (op->state != ncclProxyOpNone && ret == ncclSuccess && !op->idle) {
+        // still not finished, run it next round
+        if (pendNext < NCCL_JRING_PROXY_BURST_SIZE ) pending[pendNext++] = op;
       }
     }
-    lastIdle = idle;
+    pendCnt = pendNext;
+
+    // 2) batch dequeue more args
+    ncclProxyGetPostedOps(proxyState, batch, &added, threadId);
+    for (int i = 0; i < added; i++) {
+      struct ncclProxyArgs* op = &batch[i];
+      if (op->state == ncclProxyOpNone) {
+        // stop signal: asyncResult
+        __atomic_store_n(&proxyState->asyncResult, ncclSuccess, __ATOMIC_RELEASE);
+        goto done;
+      }
+      ncclResult_t ret = op->progress(proxyState, op);
+      if (op->state != ncclProxyOpNone && ret == ncclSuccess && !op->idle) {
+        // not finished, add the args to pending list
+        if (pendCnt < NCCL_JRING_PROXY_BURST_SIZE) pending[pendCnt++] = op;
+      }
+    }
+    
+    if (pendCnt == 0 && added == 0) {
+      sched_yield();
+      continue;
+    }
+
   } while ((state->stop == 0 || (state->stop == 1 && state->active)) && __atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) == 0);
+
+  done:
   return NULL;
 }
 
@@ -964,44 +909,42 @@ ncclResult_t ncclProxyStart(struct ncclComm* comm) {
   struct ncclProxyOps* proxyOps = comm->proxyState->proxyOps;
   if (proxyOps == NULL) return ncclSuccess;
   TIME_START(1);
-  for (int r = 0; r < comm->sharedRes->tpNLocalRanks; r++) {
-    struct ncclProxyOps* ops = proxyOps + r;
-    if (ops->pool == NULL || ops->nextOps == -1) continue;
-    NCCLCHECK(ncclProxyPost(ops->pool, ops->nextOps, ops->nextOpsEnd));
-    ops->nextOps = ops->nextOpsEnd = -1;
-    ops->count = 0;
-  }
   comm->opCount++;
   TIME_STOP(1);
   return ncclSuccess;
 }
 
-static ncclResult_t ncclProxyProgressCreate(struct ncclProxyState* proxyState) {
-  struct ncclProxyProgressState* state = &proxyState->progressState;
+static ncclResult_t ncclProxyProgressCreate(struct ncclProxyState* proxyState, int threadId) {
+  if(threadId > N_PROXY_PROGRESS) {
+    WARN("[Proxy Progress] ncclProxyProgressCreate with invalid threadId %d", threadId);
+    return ncclInvalidArgument;
+  }
+  struct ncclProxyProgressState* state = &proxyState->progressState[threadId];
   if (!state->thread) {
-    PTHREADCHECK(pthread_create(&state->thread, NULL, ncclProxyProgress, proxyState), "pthread_create");
+    struct ncclProxyProgressArgs* args = (struct ncclProxyProgressArgs*)malloc(sizeof(struct ncclProxyProgressArgs));
+    args->proxyState = proxyState;
+    args->threadId = threadId;
+    PTHREADCHECK(pthread_create(&state->thread, NULL, ncclProxyProgress, args), "pthread_create");
     ncclSetThreadName(state->thread, "NCCL Progress%2d", proxyState->tpLocalnRanks);
   }
   return ncclSuccess;
 }
 
 ncclResult_t ncclProxyProgressDestroy(struct ncclProxyState* proxyState) {
-  struct ncclProxyProgressState* state = &proxyState->progressState;
+  for (int ti = 0; ti < N_PROXY_PROGRESS; ti++) {
+    // Request the proxy to stop and then wake it
+    struct ncclProxyProgressState* state = &proxyState->progressState[ti];
+    if(state->opsPool) {
+      state->stop = 1;
+      PTHREADCHECK(pthread_join(state->thread, NULL), "pthread_join");
+    }
 
-  // Request the proxy to stop and then wake it
-  if (state->opsPool) {
-    pthread_mutex_lock(&state->opsPool->mutex);
-    state->stop = 1;
-    pthread_cond_signal(&state->opsPool->cond);
-    pthread_mutex_unlock(&state->opsPool->mutex);
-    PTHREADCHECK(pthread_join(state->thread, NULL), "pthread_join");
-  }
-
-  // Free off any memory allocated for the proxy arg pools
-  while (state->pools != NULL) {
-    struct ncclProxyPool *next = state->pools->next;
-    free(state->pools);
-    state->pools = next;
+    // Free off any memory allocated for the proxy arg pools
+    while (state->pools != NULL) {
+      struct ncclProxyPool *next = state->pools->next;
+      free(state->pools);
+      state->pools = next;
+    }
   }
 
   TIME_PRINT("Proxy");
@@ -1120,6 +1063,7 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
   // This usually sends proxyConn->connection to identify which connection this is.
   // However, this is part of the response and therefore is ignored
   NCCLCHECK(ncclProxyCallBlocking(comm, proxyConn, ncclProxyMsgInit, &req, sizeof(req), &resp, sizeof(resp)));
+  // we return first jring's pointer at ncclProxyMsgInit，resp's shmPath is the first jring pointer
   proxyConn->connection = resp.connection;
 
   // If we need proxy progress, map progress ops
@@ -1128,9 +1072,19 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
     char poolPath[] = "/dev/shm/nccl-XXXXXX";
     strncpy(poolPath+sizeof("/dev/shm/nccl-")-1, resp.devShmPath, sizeof("XXXXXX")-1);
     struct ncclProxyOps* proxyOps = sharedProxyState->proxyOps + proxyConn->tpLocalRank;
-    if (proxyOps->pool == NULL) {
-      NCCLCHECK(ncclShmOpen(poolPath, sizeof(poolPath), sizeof(struct ncclProxyOpsPool), (void**)(&proxyOps->pool), NULL, -1, &proxyOps->handle));
-      proxyOps->nextOps = proxyOps->nextOpsEnd = proxyOps->freeOp = -1;
+    size_t ring_sz = align_up(
+        jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER), // 存在风险， args内有指针，消费进程可能无法使用该指针？// ring size大小都行，只是影响性能
+        JRING_CACHE_LINE_SIZE);
+    size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
+
+    // open shm once time, give the first pointer to rinhBufs[0]
+    proxyOps->pool = (struct ncclProxyOpsPool*)calloc(1, sizeof(struct ncclProxyOpsPool));
+    if (proxyOps->pool->ringBufs[0] == NULL) {
+      NCCLCHECK(ncclShmOpen(poolPath, sizeof(poolPath), shm_sz, (void**)(&proxyOps->pool->ringBufs[0]), NULL, -1, &proxyOps->handle));
+    }
+    // other jring pointers
+    for (int ti = 1; ti < N_PROXY_PROGRESS; ti++) {
+      proxyOps->pool->ringBufs[ti] = (struct jring*)((char*)proxyOps->pool->ringBufs[0] + ti * ring_sz);
     }
   }
   proxyConn->initialized = true;
@@ -1326,54 +1280,47 @@ fail:
 }
 
 static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
-  struct ncclProxyProgressState* state = &proxyState->progressState;
-  if (state->opsPool == NULL) {
-    int size = sizeof(struct ncclProxyOpsPool);
-    struct ncclProxyOpsPool* pool = NULL;
+  // shm buffer size : N_PROXY_PROGRESS x jring 
+  // open a shm buffer once time, layout: | thread1's jring buffer | thread2's jring buffer | ... | N_PROXY_PROGRESS
+  size_t ring_sz = align_up(
+        jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER),
+        JRING_CACHE_LINE_SIZE);
+  size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
 
-    char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
-    shmPath[0] = '\0';
-    NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), size, (void**)&pool, NULL, proxyState->tpLocalnRanks, &state->handle));
-    // Init pool
-    pool->nextOps = -1;
+  struct jring* ringBuf = NULL;
+  struct ncclProxyProgressState* state0 = &proxyState->progressState[0];
 
-    for (int r = 0; r < proxyState->tpLocalnRanks; r++) {
-      pool->freeOps[r] = r*MAX_OPS_PER_PEER;
-      for (int i=0; i<MAX_OPS_PER_PEER-1; i++) pool->ops[r*MAX_OPS_PER_PEER+i].next = r*MAX_OPS_PER_PEER+i+1;
-      pool->ops[(r+1)*MAX_OPS_PER_PEER-1].next = -1;
-    }
+  char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
+  shmPath[0] = '\0';
+  NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), shm_sz, (void**)&ringBuf, NULL, proxyState->tpLocalnRanks, &state0->handle)); // all threads use thread0's handle to manager shm/refCount etc.
 
-    // Setup mutex/cond to work inter-process
-    pthread_mutexattr_t mutexAttr;
-    pthread_mutexattr_init(&mutexAttr);
-    pthread_mutexattr_setpshared(&mutexAttr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&pool->mutex, &mutexAttr);
-    pthread_mutexattr_destroy(&mutexAttr);
-    pthread_condattr_t condAttr;
-    pthread_condattr_init(&condAttr);
-    pthread_condattr_setpshared(&condAttr, PTHREAD_PROCESS_SHARED);
-    pthread_cond_init(&pool->cond, &condAttr);
-    pthread_condattr_destroy(&condAttr);
-    state->opsPool = pool;
+  for (int ti = 0; ti < N_PROXY_PROGRESS; ti++) {
+    struct ncclProxyProgressState* state = &proxyState->progressState[ti];
+
+    state->handle = state0->handle; // use thread0's handle
+    proxyState->progressState[ti].opsPool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool)); // init for each state
+    state->opsPool->ringBufs[ti] = (struct jring*)((char*)ringBuf + ti * ring_sz);
 
     memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
-
+   
     // All ops structures are created, we can start the progress thread
-    NCCLCHECK(ncclProxyProgressCreate(proxyState));
+    NCCLCHECK(ncclProxyProgressCreate(proxyState, ti)); // launch threadx
   }
   return ncclSuccess;
 }
 
 static void proxyOpsFree(struct ncclProxyState* proxyState) {
-  struct ncclProxyProgressState* state = &proxyState->progressState;
+  // we only free thread0's handle
+  struct ncclProxyProgressState* state = &proxyState->progressState[0];
   if (ncclShmClose(state->handle) != ncclSuccess) {
     WARN("[Service thread] shm close failed");
   }
 }
 
 ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm) {
-  struct ncclProxyProgressState* state = &comm->proxyState->progressState;
-  if (state->opsPool == NULL) return ncclSuccess;
+  // we only unlink thread0's shm
+  struct ncclProxyProgressState* state = &comm->proxyState->progressState[0];
+  if (state->opsPool->ringBufs[0] == NULL) return ncclSuccess;
 
   if (ncclShmUnlink(state->handle) != ncclSuccess) {
     WARN("[Service thread] proxy ops shm unlink failed");
@@ -1386,6 +1333,7 @@ static ncclResult_t proxyConnInit(struct ncclProxyLocalPeer* peer, struct ncclPr
   NCCLCHECK(ncclProxyNewConnection(connectionPool, &id));
   NCCLCHECK(ncclProxyGetConnection(connectionPool, id, connection));
 
+  (*connection)->id = id;
   (*connection)->sock = &peer->sock;
   (*connection)->transport = req->transport;
   (*connection)->send = req->send;
@@ -1400,8 +1348,8 @@ static ncclResult_t proxyConnInit(struct ncclProxyLocalPeer* peer, struct ncclPr
   // If we need proxy progress, let's allocate ops and start the thread
   if ((*connection)->tcomm->proxyProgress) {
     NCCLCHECK(proxyProgressInit(proxyState));
-    struct ncclProxyProgressState* state = &proxyState->progressState;
-    strncpy(resp->devShmPath, state->opsPoolShmSuffix, sizeof(resp->devShmPath));
+    struct ncclProxyProgressState* state = &proxyState->progressState[0]; // only response thread0's state
+    strncpy(resp->devShmPath, state->opsPoolShmSuffix, sizeof(resp->devShmPath)); // only response thread0's shm suffix
   }
   INFO(NCCL_NET|NCCL_PROXY, "New proxy %s connection %d from local rank %d, transport %d", (*connection)->send ? "send":"recv", id, (*connection)->tpLocalRank, (*connection)->transport);
   __atomic_store_n(&(*connection)->state, connInitialized, __ATOMIC_RELEASE);

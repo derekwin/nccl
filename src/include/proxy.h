@@ -197,23 +197,48 @@ struct ncclProxyArgs {
 // Otherwise we'd be unable to post half of them to free new elements. Each
 // p2p work contains a send and recv proxy op hence the 2x before it.
 #define MAX_OPS_PER_PEER (2*MAXCHANNELS*2*NCCL_MAX_DEV_WORK_P2P_PER_BATCH)
+#define USED_MAP_SIZE_IN_UINT8 ((NCCL_MAX_LOCAL_RANKS + 1 + 7) / 8)
+#define NCCL_MAX_PROXY_CONNECTIONS (NCCL_MAX_LOCAL_RANKS + 1)
+// #define NCCL_MAX_PROXY_CONNECTIONS NCCL_PROXY_CONN_POOL_SIZE // ?
+#define N_PROXY_PROGRESS 4
+
+// check bit has been set
+#define TEST_BIT(map, bit) \
+    (((bit) >= 0 && (bit) < NCCL_MAX_PROXY_CONNECTIONS) ? \
+     ((map)[(bit)/8] & (1U << ((bit) % 8))) : 0)
+
+// set bit
+#define SET_BIT(map, bit) do { \
+    if ((bit) >= 0 && (bit) < NCCL_MAX_PROXY_CONNECTIONS) { \
+        (map)[(bit)/8] |= (1U << ((bit) % 8)); \
+    } \
+} while(0)
+
+// clean bit map
+#define CLEAR_ALL_BITS(map) do { \
+    memset((map), 0, USED_MAP_SIZE_IN_UINT8); \
+} while(0)
 
 struct ncclProxyOpsPool {
-  struct ncclProxyOp ops[MAX_OPS_PER_PEER*NCCL_MAX_LOCAL_RANKS];
-  volatile int nextOps;
-  volatile int nextOpsEnd;
-  volatile int freeOps[NCCL_MAX_LOCAL_RANKS];
-  pthread_mutex_t mutex;
-  pthread_cond_t cond;
+  struct jring* ringBufs[N_PROXY_PROGRESS];
 };
 
 struct ncclProxyOps {
   ncclProxyOpsPool* pool;
   ncclShmHandle_t handle;
-  int count;
-  int freeOp;
-  int nextOps;
-  int nextOpsEnd;
+
+  // for main thread: the producer
+  int count;  // tmp op count
+  struct ncclProxyOp tmpOp[MAX_OPS_PER_PEER];      // tmp save all ops with same opCount
+
+  struct {
+    struct ncclProxyArgs* args;                    // args head
+    struct ncclProxyArgs* lastArgs;                // args tail: for nextPeer
+  } tmpArgsPerConn[NCCL_MAX_PROXY_CONNECTIONS];    // NCCL_MAX_PROXY_CONNECTIONS ？// conn->id as key
+
+  int connIdList[NCCL_MAX_PROXY_CONNECTIONS];      // conn is being used
+  int connUsedCount;                               // num of conn is being used
+  uint8_t usedMap[USED_MAP_SIZE_IN_UINT8];         // if conn is being used
 };
 
 struct ncclProxySharedP2p {
@@ -336,8 +361,8 @@ struct ncclProxyState {
   uint64_t *peerAddressesUDS; // cuMem API support (UDS)
 
   // Progress thread
-  struct ncclProxyProgressState progressState;
-
+  struct ncclProxyProgressState progressState[N_PROXY_PROGRESS];
+  
   // Profiler plugin
   void* profilerContext;
 
@@ -355,6 +380,7 @@ enum proxyConnectState {
 };
 
 struct ncclProxyConnection {
+  int id;
   int send, transport, shared;
   int tpLocalRank, sameProcess;
   struct ncclSocket* sock;
