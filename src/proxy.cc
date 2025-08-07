@@ -859,6 +859,7 @@ void* ncclProxyProgress(void* args_) {
     pendNext = 0;
     for (int i = 0; i < pendCnt; i++) {
       struct ncclProxyArgs* op = pending[i];
+      INFO(NCCL_TUNING, "error aaaa");
       ncclResult_t ret = op->progress(proxyState, op);
       if (op->state != ncclProxyOpNone && ret == ncclSuccess && !op->idle) {
         // still not finished, run it next round
@@ -876,7 +877,10 @@ void* ncclProxyProgress(void* args_) {
         __atomic_store_n(&proxyState->asyncResult, ncclSuccess, __ATOMIC_RELEASE);
         goto done;
       }
+      // todoError
+      INFO(NCCL_TUNING, "error abbb");
       ncclResult_t ret = op->progress(proxyState, op);
+      INFO(NCCL_TUNING, "error accc");
       if (op->state != ncclProxyOpNone && ret == ncclSuccess && !op->idle) {
         // not finished, add the args to pending list
         if (pendCnt < NCCL_JRING_PROXY_BURST_SIZE) pending[pendCnt++] = op;
@@ -1065,14 +1069,21 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
         jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER), // 存在风险， args内有指针，消费进程可能无法使用该指针？// ring size大小都行，只是影响性能
         JRING_CACHE_LINE_SIZE);
     size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
-
+    INFO(NCCL_NET|NCCL_PROXY, "poolpath is %s", poolPath);
     // open shm once time, give the first pointer to rinhBufs[0]
-    if (proxyOps->pool == NULL && proxyOps->pool->ringBufs[0] == NULL) { 
+    if (proxyOps->pool == NULL) {
+      proxyOps->pool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool));
+    }
+    INFO(NCCL_NET|NCCL_PROXY, "error1");
+    if (proxyOps->pool->ringBufs[0] == NULL) { 
       NCCLCHECK(ncclShmOpen(poolPath, sizeof(poolPath), shm_sz, (void**)(&proxyOps->pool->ringBufs[0]), NULL, -1, &proxyOps->handle));
     }
+    INFO(NCCL_NET|NCCL_PROXY, "error2");
+    // todoError not here
     // other jring pointers
     for (int ti = 1; ti < N_PROXY_PROGRESS; ti++) {
       proxyOps->pool->ringBufs[ti] = (struct jring*)((char*)proxyOps->pool->ringBufs[0] + ti * ring_sz);
+      INFO(NCCL_NET|NCCL_PROXY, "error3 %d", ti);
     }
   }
   proxyConn->initialized = true;
@@ -1286,6 +1297,7 @@ static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
     struct ncclProxyProgressState* state = &proxyState->progressState[ti];
 
     state->handle = state0->handle; // use thread0's handle
+    proxyState->progressState[ti].opsPool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool)); // init for each state
     state->opsPool->ringBufs[ti] = (struct jring*)((char*)ringBuf + ti * ring_sz);
 
     memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);

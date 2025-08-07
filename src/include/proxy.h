@@ -199,7 +199,7 @@ struct ncclProxyArgs {
 #define MAX_OPS_PER_PEER (2*MAXCHANNELS*2*NCCL_MAX_DEV_WORK_P2P_PER_BATCH)
 #define USED_MAP_SIZE_IN_UINT8 ((NCCL_MAX_LOCAL_RANKS + 1 + 7) / 8)
 #define NCCL_MAX_PROXY_CONNECTIONS (NCCL_MAX_LOCAL_RANKS + 1)
-#define N_PROXY_PROGRESS 4
+#define N_PROXY_PROGRESS 1
 
 // check bit has been set
 #define TEST_BIT(map, bit) \

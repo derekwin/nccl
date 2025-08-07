@@ -745,6 +745,7 @@ static ncclResult_t scheduleCollTasksToPlan(
     }
 
     if (comm->rank == 0) {
+      // todoError here
       INFO(NCCL_TUNING, "%s: %ld Bytes -> Algo %s proto %s channel{Lo..Hi}={%d..%d}",
         ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
         ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi);
@@ -2419,13 +2420,16 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   }
   NCCLCHECKGOTO(ArgsCheck(info), ret, fail);
 
+
+  // todoError ：这里也可能是出错的地方
   INFO(NCCL_COLL,"%s: opCount %lx sendbuff %p recvbuff %p count %zu datatype %d op %d root %d comm %p [nranks=%d] stream %p",
         info->opName, info->comm->opCount, info->sendbuff, info->recvbuff, info->count,
         info->datatype, info->op, info->root, info->comm, info->comm->nRanks, info->stream);
   TRACE_CALL("nccl%s(%" PRIx64 ",%" PRIx64 ",%zu,%d,%d,%d,%p,%p)", info->opName, reinterpret_cast<int64_t>(info->sendbuff), reinterpret_cast<int64_t>(info->recvbuff), info->count, info->datatype, info->op, info->root, info->comm, info->stream);
 
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
-
+  NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
+  INFO(NCCL_TUNING, "error B");
 exit:
   if (devOld != -1) CUDACHECK(cudaSetDevice(devOld));
   ncclGroupErrCheck(ret);

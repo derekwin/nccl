@@ -560,9 +560,14 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
   }
 
   if ((!simInfo) && (groupCommHeadMain[ncclGroupTaskTypeCollective] != nullptr)) {
+    INFO(NCCL_TUNING, "error 1");
     NCCLCHECKGOTO(doLaunches(groupCommHeadMain[ncclGroupTaskTypeCollective]), ret, fail);
+    INFO(NCCL_TUNING, "error 2");
   }
-
+  // todoError : 在这里出现了异步的错误情况，123打印不全或者是123完事之后第二轮的时候出错。所以猜测是任务提交后，处理出现的问题。
+  // 测试sendProxyConnect后，发现与其无关
+  // 发现是第二次doLaunches的时候出错
+  INFO(NCCL_TUNING, "error 3");
   while (!ncclIntruQueueEmpty(asyncJobsMain)) {
     struct ncclAsyncJob* job = ncclIntruQueueDequeue(asyncJobsMain);
     if (!job->destroyFlag && job->comm && !job->comm->config.blocking && groupCommHeadMain[ncclGroupTaskTypeCollective] == nullptr)
@@ -593,6 +598,7 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
 exit:
   return ret;
 fail:
+  INFO(NCCL_TUNING, "error fail");
   groupCleanup(gjob->groupCommHead, &gjob->asyncJobs, ret);
   goto exit;
 }
