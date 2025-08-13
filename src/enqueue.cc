@@ -1270,8 +1270,12 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
     }
 
     NCCLCHECK(ncclProxySaveOp(comm, op, nullptr));
+    INFO(NCCL_NET, "upload Op %p", op);
+    INFO(NCCL_NET, "with opcount %d", op->opCount);
+    INFO(NCCL_NET, "to comm %p success", comm);
     op->opCount = oldId; // Restore for next uploadProxyOps()
     op = op->enqNext;
+    // todoError next为空，没有产生op，找op的生产者
   }
 
   if (hasp2p) {
@@ -1287,6 +1291,7 @@ static ncclResult_t hostStreamPlanTask(struct ncclComm* comm, struct ncclKernelP
   NCCLCHECK(ncclProfilerStartGroupEvent(plan));
   NCCLCHECK(ncclProfilerStartTaskEvents(plan));
   if (ncclIntruQueueHead(&plan->proxyOpQueue)) {
+    // todoError
     NCCLCHECK(uploadProxyOps(comm, plan));
     NCCLCHECK(ncclProxyStart(comm));
   }
@@ -1396,7 +1401,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   bool persistent = ncclCudaGraphValid(planner->capturingGraph);
   planner->persistent = persistent;
   int nPlans = 0;
-
+  INFO(NCCL_NET, "launchPrepare in!");
   if (planner->nTasksColl + planner->nTasksP2p != 0) {
     do {
       memset(&planner->wipPlan, 0, sizeof(planner->wipPlan));
@@ -1442,6 +1447,9 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
         // on the work budget and p2p work isn't collective. If we were to drain p2p
         // first, the place where we cut the kernel could vary by rank which would
         // cause the "shortest channel first" channel picker to have divergent results.
+
+        // todoError
+        INFO(NCCL_NET, "launchPrepare nTaskColl %d, nTaskP2p %d", planner->nTasksColl, planner->nTasksP2p);
         if (planner->nTasksColl != 0) {
           NCCLCHECKGOTO(scheduleCollTasksToPlan(comm, plan, &budget), result, failure);
         }
@@ -1517,7 +1525,8 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       NCCLCHECKGOTO(ncclCudaGraphAddDestructor(planner->capturingGraph, persistentDestructor, (void*)planHead), result, failure);
     }
   }
-failure:
+  INFO(NCCL_NET, "launchPrepare out!");
+failure: // 此函数内INFO打印过多，会导致连接建立出现问题
   return result;
 }
 
@@ -2278,7 +2287,10 @@ static ncclResult_t hostToDevRedOp(
 static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   struct ncclKernelPlanner *planner = &comm->planner;
 
+  INFO(NCCL_COLL,"taskAppend");
+
   if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
+    INFO(NCCL_COLL,"taskAppend send or recv");
     int peer = info->root;
     ssize_t nBytes = info->count*ncclTypeSize(info->datatype);
     bool isSendNotRecv = info->coll == ncclFuncSend;
@@ -2331,6 +2343,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       }
     }
   } else {
+    INFO(NCCL_COLL,"taskAppend coll");
     // Empty collectives can be discarded.
     if (info->count == 0) return ncclSuccess;
 
@@ -2418,7 +2431,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
     CUDACHECKGOTO(cudaSetDevice(info->comm->cudaDev), ret, fail);
   }
   NCCLCHECKGOTO(ArgsCheck(info), ret, fail);
-
+  // todoError 这里由应用调用api发起，然后
   INFO(NCCL_COLL,"%s: opCount %lx sendbuff %p recvbuff %p count %zu datatype %d op %d root %d comm %p [nranks=%d] stream %p",
         info->opName, info->comm->opCount, info->sendbuff, info->recvbuff, info->count,
         info->datatype, info->op, info->root, info->comm, info->comm->nRanks, info->stream);

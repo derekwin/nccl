@@ -768,7 +768,7 @@ NCCL_PARAM(ProxyAppendBatchSize, "PROXY_APPEND_BATCH_SIZE", 16);
 
 #define NCCL_JRING_PROXY_BURST_SIZE 16
 static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, 
-                                          struct ncclProxyArgs* batch,    // output：head pointer of the list of args we got
+                                          struct ncclProxyArgs** batch,    // output：head pointer of the list of args we got
                                           int* added,                     // output：the num of args we got
                                           int threadId) {
     struct ncclProxyOpsPool* pool = proxyState->progressState[threadId].opsPool;
@@ -862,7 +862,7 @@ void* ncclProxyProgress(void* args_) {
   struct ncclProxyArgs* pending[NCCL_JRING_PROXY_BURST_SIZE];
   int pendCnt = 0, pendNext;
 
-  struct ncclProxyArgs batch[NCCL_JRING_PROXY_BURST_SIZE];
+  struct ncclProxyArgs* batch[NCCL_JRING_PROXY_BURST_SIZE];
   int added = 0;
 
   do {
@@ -881,12 +881,59 @@ void* ncclProxyProgress(void* args_) {
     // 2) batch dequeue more args
     ncclProxyGetPostedOps(proxyState, batch, &added, threadId);
     for (int i = 0; i < added; i++) {
-      struct ncclProxyArgs* op = &batch[i];
+      struct ncclProxyArgs* op = batch[i];
+      if (op == NULL) continue;
+
       if (op->state == ncclProxyOpNone) {
         // stop signal: asyncResult
         __atomic_store_n(&proxyState->asyncResult, ncclSuccess, __ATOMIC_RELEASE);
         goto done;
       }
+
+      // 这里args无法获取connection // Error
+      /*
+      
+      struct ncclProxyArgs **connTailPtr = op->connection->proxyAppendPtr;
+      struct ncclProxyArgs *inHead = op;
+      struct ncclProxyArgs *inTail = op;
+
+      // Find incoming chain tail
+      const int MAX_PEER_CHAIN_LEN = 1 << 20;
+      int seen = 0;
+      for (struct ncclProxyArgs *p = inHead; p != NULL; p = p->nextPeer) {
+        inTail = p;
+        if (++seen > MAX_PEER_CHAIN_LEN) {
+          INFO(NCCL_NET, "ProxyProgress: nextPeer chain too long or cycle detected for connection %p, aborting attach", (void*)op->connection);
+          break;
+        }
+      }
+
+      // Attach incoming chain to per-connection chain or to global active list
+      // Use atomic load to read existing tail to avoid tearing
+      struct ncclProxyArgs *oldTail = NULL;
+      if (connTailPtr) oldTail = __atomic_load_n(connTailPtr, __ATOMIC_ACQUIRE);
+
+      if (connTailPtr && oldTail) {
+        // existing per-connection tail exists: link it to incoming head
+        // We assume nobody else will concurrently change oldTail->nextPeer;
+        oldTail->nextPeer = inHead;
+
+        // 更新 connection 的 tail 指针为 inTail
+        __atomic_store_n(connTailPtr, inTail, __ATOMIC_RELEASE);
+      } else {
+        // 没有现成的 tail：说明此 connection 目前没有 active，需把 incoming head 加入全局 active 列表
+        if (state->active == NULL) {
+          state->active = inHead;
+        } else {
+          struct ncclProxyArgs *last = state->active;
+          while (last->next) last = last->next;
+          last->next = inHead;
+        }
+        if (connTailPtr) __atomic_store_n(connTailPtr, inTail, __ATOMIC_RELEASE);
+      }
+
+      */
+
       ncclResult_t ret = op->progress(proxyState, op);
       if (op->state != ncclProxyOpNone && ret == ncclSuccess && !op->idle) {
         // not finished, add the args to pending list
@@ -1068,25 +1115,16 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
 
   // If we need proxy progress, map progress ops
   struct ncclTransportComm* tcomm = send ? &ncclTransports[transport]->send : &ncclTransports[transport]->recv;
-  if (tcomm->proxyProgress) {
-    char poolPath[] = "/dev/shm/nccl-XXXXXX";
-    strncpy(poolPath+sizeof("/dev/shm/nccl-")-1, resp.devShmPath, sizeof("XXXXXX")-1);
-    struct ncclProxyOps* proxyOps = sharedProxyState->proxyOps + proxyConn->tpLocalRank;
-    size_t ring_sz = align_up(
-        jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER), // 存在风险， args内有指针，消费进程可能无法使用该指针？// ring size大小都行，只是影响性能
-        JRING_CACHE_LINE_SIZE);
-    size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
 
-    // open shm once time, give the first pointer to rinhBufs[0]
+  // proxyProgressInit.proxyState and ncclProxyConnect.sharedProxyState are the same.
+  if (tcomm->proxyProgress) {
+    struct ncclProxyOps* proxyOps = sharedProxyState->proxyOps + proxyConn->tpLocalRank;
+    // open shm once time, give the first pointer to ringBufs[0]
     if (proxyOps->pool == NULL) {
       proxyOps->pool = (struct ncclProxyOpsPool*)calloc(1, sizeof(struct ncclProxyOpsPool));
-      if (proxyOps->pool->ringBufs[0] == NULL) {
-        NCCLCHECK(ncclShmOpen(poolPath, sizeof(poolPath), shm_sz, (void**)(&proxyOps->pool->ringBufs[0]), NULL, -1, &proxyOps->handle));
-      }
-      // 在这里获取，proxyOps是可靠的,comm也是可靠的（考虑把pool存到）
       // other jring pointers
-      for (int ti = 1; ti < N_PROXY_PROGRESS; ti++) {
-        proxyOps->pool->ringBufs[ti] = (struct jring*)((char*)proxyOps->pool->ringBufs[0] + ti * ring_sz);
+      for (int ti = 0; ti < N_PROXY_PROGRESS; ti++) {
+        proxyOps->pool->ringBufs[ti] = sharedProxyState->progressState[ti].opsPool->ringBufs[ti];
       }
     }
   }
@@ -1282,30 +1320,57 @@ fail:
   goto exit;
 }
 
+// static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
+//   struct ncclProxyProgressState* state0 = &proxyState->progressState[0];
+//   if (state0->opsPool == NULL) {
+//     // shm buffer size : N_PROXY_PROGRESS x jring 
+//     // open a shm buffer once time, layout: | thread1's jring buffer | thread2's jring buffer | ... | N_PROXY_PROGRESS
+//     size_t ring_sz = align_up(
+//           jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER),
+//           JRING_CACHE_LINE_SIZE);
+//     size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
+
+//     struct jring* ringBuf = NULL;
+
+//     char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
+//     shmPath[0] = '\0';
+//     NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), shm_sz, (void**)&ringBuf, NULL, proxyState->tpLocalnRanks, &state0->handle)); // all threads use thread0's handle to manager shm/refCount etc.
+
+//     for (int ti = 0; ti < N_PROXY_PROGRESS; ti++) {
+//       struct ncclProxyProgressState* state = &proxyState->progressState[ti];
+
+//       state->handle = state0->handle; // use thread0's handle
+//       proxyState->progressState[ti].opsPool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool)); // init for each state
+//       state->opsPool->ringBufs[ti] = (struct jring*)((char*)ringBuf + ti * ring_sz);
+
+//       memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
+    
+//       // All ops structures are created, we can start the progress thread
+//       NCCLCHECK(ncclProxyProgressCreate(proxyState, ti)); // launch threadx
+//     }
+//   }
+//   return ncclSuccess;
+// }
+
 static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
+  // proxyState's proxyOps is for main thread
+  // proxyProgressInit.proxyState and ncclProxyConnect.sharedProxyState are the same.
   struct ncclProxyProgressState* state0 = &proxyState->progressState[0];
   if (state0->opsPool == NULL) {
-    // shm buffer size : N_PROXY_PROGRESS x jring 
-    // open a shm buffer once time, layout: | thread1's jring buffer | thread2's jring buffer | ... | N_PROXY_PROGRESS
     size_t ring_sz = align_up(
           jring_get_buf_ring_size(sizeof(struct ncclProxyArgs), MAX_OPS_PER_PEER),
           JRING_CACHE_LINE_SIZE);
-    size_t shm_sz  = ring_sz * N_PROXY_PROGRESS;
-
-    struct jring* ringBuf = NULL;
-
-    char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
-    shmPath[0] = '\0';
-    NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), shm_sz, (void**)&ringBuf, NULL, proxyState->tpLocalnRanks, &state0->handle)); // all threads use thread0's handle to manager shm/refCount etc.
 
     for (int ti = 0; ti < N_PROXY_PROGRESS; ti++) {
       struct ncclProxyProgressState* state = &proxyState->progressState[ti];
 
       state->handle = state0->handle; // use thread0's handle
-      proxyState->progressState[ti].opsPool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool)); // init for each state
-      state->opsPool->ringBufs[ti] = (struct jring*)((char*)ringBuf + ti * ring_sz);
+      state->opsPool = (struct ncclProxyOpsPool*)malloc(sizeof(struct ncclProxyOpsPool)); // init for each state
+      void *buf = malloc(ring_sz);
+      if (!buf) { perror("proxyProgressInit malloc"); return ncclInternalError; }
+      state->opsPool->ringBufs[ti] = (struct jring*)buf;
 
-      memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
+      // memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
     
       // All ops structures are created, we can start the progress thread
       NCCLCHECK(ncclProxyProgressCreate(proxyState, ti)); // launch threadx
