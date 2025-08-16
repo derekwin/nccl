@@ -197,23 +197,18 @@ struct ncclProxyArgs {
 // Otherwise we'd be unable to post half of them to free new elements. Each
 // p2p work contains a send and recv proxy op hence the 2x before it.
 #define MAX_OPS_PER_PEER (2*MAXCHANNELS*2*NCCL_MAX_DEV_WORK_P2P_PER_BATCH)
+#define NCCL_MAX_PROXY_CONNECTIONS (NCCL_MAX_LOCAL_RANKS + 1)
+#define N_PROXY_PROGRESS 1
+#define ROUND_UP_POW2(x) (1UL << (64 - __builtin_clzl((x)-1)))
+#define MAX_OPS_PER_JRING \
+    ROUND_UP_POW2(MAX_OPS_PER_PEER * NCCL_MAX_PROXY_CONNECTIONS / N_PROXY_PROGRESS)
 
 struct ncclProxyOpsPool {
-  struct ncclProxyOp ops[MAX_OPS_PER_PEER*NCCL_MAX_LOCAL_RANKS];
-  volatile int nextOps;
-  volatile int nextOpsEnd;
-  volatile int freeOps[NCCL_MAX_LOCAL_RANKS];
-  pthread_mutex_t mutex;
-  pthread_cond_t cond;
+  struct jring* ringBufs[N_PROXY_PROGRESS];
 };
 
 struct ncclProxyOps {
   ncclProxyOpsPool* pool;
-  ncclShmHandle_t handle;
-  int count;
-  int freeOp;
-  int nextOps;
-  int nextOpsEnd;
 };
 
 struct ncclProxySharedP2p {
@@ -241,11 +236,10 @@ struct ncclSharedNetComms {
 };
 
 struct ncclProxyPool;
+#define PENDING_QUEUE_SIZE MAX_OPS_PER_JRING*2
 struct ncclProxyProgressState {
   // Used by main threads to send work to progress thread
   struct ncclProxyOpsPool* opsPool;
-  ncclShmHandle_t handle;
-  char opsPoolShmSuffix[6];
 
   pthread_t thread;
   volatile int stop;
@@ -254,8 +248,43 @@ struct ncclProxyProgressState {
   struct ncclProxyArgs* active;
   struct ncclProxyArgs* pool;
   struct ncclProxyPool* pools;
-  int nextOps;
+
+  struct ncclProxyOp* pendingOp[PENDING_QUEUE_SIZE];
+  unsigned headOp;
+  unsigned tailOpP; // can be progress
+  unsigned tailOp;
 };
+
+static inline int pendingOpCanProgress(struct ncclProxyProgressState* s) {
+  return !(s->headOp == s->tailOpP);
+}
+static inline int pendingOpIsEmpty(struct ncclProxyProgressState* s) {
+  return s->headOp == s->tailOp;
+}
+static inline int pendingOpIsFull(struct ncclProxyProgressState* s) {
+  int next = s->tailOp + 1;
+  if (next >= PENDING_QUEUE_SIZE) next -= PENDING_QUEUE_SIZE;
+  return next == s->headOp;
+}
+static inline int pendingOpSizeCanProgress(struct ncclProxyProgressState* s) {
+  int t = s->tailOpP - s->headOp;
+  if (t < 0) t += PENDING_QUEUE_SIZE;
+  return t;
+}
+static inline int pendingOpEnqueue(struct ncclProxyProgressState* s, struct ncclProxyOp* e) {
+  if (pendingOpIsFull(s)) return -1;
+  s->pendingOp[s->tailOp] = e;
+  s->tailOp++;
+  if (s->tailOp >= PENDING_QUEUE_SIZE) s->tailOp = 0;
+  return 0;
+}
+static inline struct ncclProxyOp* pendingOpDequeue(struct ncclProxyProgressState* s) {
+  if (pendingOpIsEmpty(s)) return NULL;
+  struct ncclProxyOp* ret = s->pendingOp[s->headOp];
+  s->headOp++;
+  if (s->headOp >= PENDING_QUEUE_SIZE) s->headOp = 0;
+  return ret;
+}
 
 // Expected proxy response fifo
 struct ncclExpectedProxyResponse {
@@ -335,8 +364,10 @@ struct ncclProxyState {
   struct ncclIpcSocket peerIpcSock; // cuMEM API support (UDS)
   uint64_t *peerAddressesUDS; // cuMem API support (UDS)
 
+  sem_t signal; // main thread 通知 prgress 接受任务
+
   // Progress thread
-  struct ncclProxyProgressState progressState;
+  struct ncclProxyProgressState progressState[N_PROXY_PROGRESS];
 
   // Profiler plugin
   void* profilerContext;
@@ -355,6 +386,7 @@ enum proxyConnectState {
 };
 
 struct ncclProxyConnection {
+  int id;
   int send, transport, shared;
   int tpLocalRank, sameProcess;
   struct ncclSocket* sock;
