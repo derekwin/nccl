@@ -302,6 +302,8 @@ struct ncclIpcHdr {
   uint64_t data[16]; // 128-bytes
 };
 
+#define N_PROXY_THREADS 2
+
 struct ncclProxyState {
   int refCount;
   int tpRank;
@@ -330,13 +332,13 @@ struct ncclProxyState {
   // Used by main thread
   union ncclSocketAddress* peerAddresses;
   struct ncclSocket* peerSocks;
-  struct ncclProxyOps* proxyOps;
+  struct ncclProxyOps* proxyOps[N_PROXY_THREADS];
   void** sharedDevMems;
   struct ncclIpcSocket peerIpcSock; // cuMEM API support (UDS)
   uint64_t *peerAddressesUDS; // cuMem API support (UDS)
 
   // Progress thread
-  struct ncclProxyProgressState progressState;
+  struct ncclProxyProgressState progressState[N_PROXY_THREADS];
 
   // Profiler plugin
   void* profilerContext;
@@ -355,6 +357,7 @@ enum proxyConnectState {
 };
 
 struct ncclProxyConnection {
+  int id;
   int send, transport, shared;
   int tpLocalRank, sameProcess;
   struct ncclSocket* sock;
